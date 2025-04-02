@@ -7,14 +7,16 @@ from json import dumps as json_dumps
 from time import time
 from types import ModuleType
 from typing import Any, Callable, Sequence, Type
+from typing import cast
 
 from pydantic import BaseModel
 
+from iceaxe.base import TableBase
 from iceaxe.migrations.migration import MigrationRevisionBase
 from iceaxe.migrations.migrator import Migrator
 from iceaxe.schemas.actions import DatabaseActions, DryRunAction, DryRunComment
 from iceaxe.schemas.db_memory_serializer import DatabaseMemorySerializer
-from iceaxe.schemas.db_stubs import DBObject, DBObjectPointer
+from iceaxe.schemas.db_stubs import DBObject, DBObjectPointer, DBPolicy
 
 MIGRATION_TEMPLATE = """
 {header_imports}
@@ -50,6 +52,7 @@ class MigrationGenerator:
     - Constraint management
     - Type creation and updates
     - Import tracking for required dependencies
+    - Row Level Security policies
 
     ```python {{sticky: True}}
     # Generate a new migration
@@ -402,3 +405,87 @@ class MigrationGenerator:
         ```
         """
         return "\n".join([f"{' ' * 4 * indent}{line}" for line in code])
+
+    def generate_rls_policy_sql(self, models: list[Type[TableBase]], force_rls: bool = True) -> list[str]:
+        """
+        Generate SQL statements to sync RLS policies for the given models.
+        
+        Args:
+            models: The models with RLS policies to sync
+            force_rls: Whether to force RLS for the table owner (defaults to True)
+            
+        Returns:
+            List of SQL statements to execute
+        """
+        from iceaxe.rls import RLSProtocol
+        
+        sql_statements = []
+        
+        # Track tables that need RLS enabled
+        rls_tables = set()
+        
+        for model in models:
+            # Skip models that don't have RLS policies
+            if not hasattr(model, 'get_rls_policies'):
+                continue
+                
+            table_name = model.get_table_name()
+            policies = []
+            
+            # Get policies from the model
+            policies = model.get_rls_policies()
+            
+            if not policies:
+                continue
+                
+            # Enable RLS for the table
+            rls_tables.add(table_name)
+            
+            # Create policies
+            for policy in policies:
+                sql_statements.append(policy.to_sql_statement())
+        
+        # Enable RLS for all tables with policies
+        for table_name in rls_tables:
+            sql_statements.insert(0, f"ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY;")
+            if force_rls:
+                sql_statements.insert(1, f"ALTER TABLE {table_name} FORCE ROW LEVEL SECURITY;")
+            
+        return sql_statements
+        
+    def create_rls_policy_objects(self, models: list[Type[TableBase]]) -> list[DBPolicy]:
+        """
+        Create DBPolicy objects for all RLS policies defined in the given models.
+        
+        Args:
+            models: The models with RLS policies to convert to DBPolicy objects
+            
+        Returns:
+            List of DBPolicy objects
+        """
+        policy_objects = []
+        
+        for model in models:
+            # Skip models that don't have RLS policies
+            if not hasattr(model, 'get_rls_policies'):
+                continue
+                
+            table_name = model.get_table_name()
+            policies = model.get_rls_policies()
+            
+            if not policies:
+                continue
+                
+            # Create DBPolicy objects for each policy
+            for policy in policies:
+                policy_objects.append(DBPolicy(
+                    table_name=table_name,
+                    policy_name=policy.name,
+                    restrictive=policy.restrictive,
+                    command=policy.command,
+                    role=str(policy.to),
+                    using_expr=policy.using,
+                    check_expr=policy.check
+                ))
+                
+        return policy_objects

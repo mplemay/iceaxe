@@ -6,6 +6,7 @@ from typing import (
     Self,
     Type,
     dataclass_transform,
+    Sequence,
 )
 
 from pydantic import BaseModel, Field as PydanticField
@@ -214,8 +215,11 @@ class TableBase(BaseModel, metaclass=DBModelMetaclass):
     - Tracking of modified fields for efficient updates
     - Support for unique constraints and indexes
     - Integration with Pydantic for validation
+    - Optional Row Level Security (RLS) policy definitions
 
     ```python {{sticky: True}}
+    from iceaxe import Policy
+
     class User(TableBase):
         # Custom table name (optional)
         table_name = "users"
@@ -232,9 +236,31 @@ class TableBase(BaseModel, metaclass=DBModelMetaclass):
             IndexConstraint(columns=["name"])
         ]
 
+        # --- RLS Policy Definition ---
+        @classmethod
+        def __rls__(cls) -> list[Policy]:
+            return [
+                Policy(
+                    name="Allow public read access",
+                    table=cls,
+                    command="SELECT",
+                    using="TRUE",
+                ),
+                Policy(
+                    name="Allow owner write access",
+                    table=cls,
+                    command="ALL",
+                    # Example assumes 'rls.user_id' is set via SET LOCAL
+                    using="user_id = current_setting('rls.user_id')::uuid",
+                    check="user_id = current_setting('rls.user_id')::uuid",
+                ),
+            ]
+
     # Usage in queries
+    # RLS context is passed during execution, e.g.:
+    # await conn.exec(query, rls_context={'rls.user_id': user_uuid})
     query = select(User).where(User.is_active == True)
-    users = await conn.execute(query)
+    users = await conn.exec(query) # RLS applied by DB if enabled/synced
     ```
     """
 
@@ -248,8 +274,31 @@ class TableBase(BaseModel, metaclass=DBModelMetaclass):
 
     table_args: ClassVar[list[UniqueConstraint | IndexConstraint]] = PydanticUndefined  # type: ignore
     """
-    Table constraints and indexes
+    Optional list of table-level constraints (e.g., UniqueConstraint, IndexConstraint)
     """
+
+    # --- RLS Policy Methods ---
+    @classmethod
+    def __rls__(cls) -> Sequence[Any]:
+        """
+        Define Row Level Security policies for this table.
+        Override this method to define RLS policies for the table.
+        
+        Returns:
+            A sequence of Policy objects that define the RLS policies for this table.
+        """
+        return []
+    
+    @classmethod
+    def get_rls_policies(cls) -> Sequence[Any]:
+        """
+        Get the RLS policies for this table.
+        This method is the standard way to access RLS policies for a table.
+        
+        Returns:
+            A sequence of Policy objects that define the RLS policies for this table.
+        """
+        return cls.__rls__()
 
     # Private methods
     modified_attrs: dict[str, Any] = Field(default_factory=dict, exclude=True)

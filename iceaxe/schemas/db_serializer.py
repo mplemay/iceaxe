@@ -17,6 +17,8 @@ from iceaxe.schemas.db_stubs import (
     DBTable,
     DBType,
     DBTypePointer,
+    DBRLSEnabled,
+    DBPolicy,
 )
 from iceaxe.session import DBConnection
 
@@ -76,13 +78,89 @@ class DatabaseSerializer:
 
     async def get_tables(self, session: DBConnection):
         result = await session.conn.fetch(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+            """
+            SELECT tablename
+            FROM pg_tables
+            WHERE schemaname = 'public'
+            AND tablename NOT IN (SELECT unnest($1::text[]))
+            """,
+            self.ignore_tables,
         )
-
         for row in result:
-            if row["table_name"] in self.ignore_tables:
-                continue
-            yield DBTable(table_name=row["table_name"]), []
+            yield DBTable(table_name=row["tablename"]), []
+
+        # Also get RLS policy information
+        result = await session.conn.fetch(
+            """
+            SELECT
+                n.nspname AS schema_name,
+                c.relname AS table_name,
+                pol.polname AS policy_name, 
+                pol.polcmd AS command,
+                pol.polroles AS roles,
+                pol.polqual AS using_clause,
+                pol.polwithcheck AS check_clause,
+                c.relrowsecurity AS rls_enabled,
+                c.relforcerowsecurity AS rls_forced
+            FROM pg_policy pol
+            JOIN pg_class c ON pol.polrelid = c.oid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public'
+            """,
+        )
+        
+        tables_with_rls = {}
+        
+        # First process RLS enabled status
+        for row in result:
+            table_name = row["table_name"]
+            if table_name not in tables_with_rls:
+                tables_with_rls[table_name] = {
+                    "enabled": row["rls_enabled"],
+                    "forced": row["rls_forced"],
+                    "policies": []
+                }
+        
+        # Then yield RLS enabled objects
+        for table_name, info in tables_with_rls.items():
+            if info["enabled"]:
+                yield DBRLSEnabled(
+                    table_name=table_name,
+                    force=info["forced"]
+                ), []
+        
+        # Process policies
+        for row in result:
+            table_name = row["table_name"]
+            cmd = row["command"]
+            # Convert Postgres command format to our format
+            command = {
+                "r": "SELECT",
+                "a": "INSERT",
+                "w": "UPDATE",
+                "d": "DELETE",
+                "*": "ALL"
+            }.get(cmd, "ALL")
+            
+            # Convert role OIDs to role names
+            role_oids = row["roles"]
+            role = ""  # Default empty role for "all roles"
+            
+            # Extract using and check expressions
+            using_expr = row["using_clause"]
+            check_expr = row["check_clause"]
+            
+            policy = DBPolicy(
+                table_name=table_name,
+                policy_name=row["policy_name"],
+                command=command,
+                role=role,
+                using_expr=using_expr,
+                check_expr=check_expr,
+                restrictive=False  # Assuming permissive by default
+            )
+            
+            yield policy, []
 
     async def get_columns(self, session: DBConnection, table_name: str):
         query = """

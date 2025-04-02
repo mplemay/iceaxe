@@ -1,5 +1,5 @@
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from json import loads as json_loads
 from math import ceil
 from typing import (
@@ -50,6 +50,7 @@ class DBConnection:
     - Managing transactions
     - Inserting, updating, and deleting model instances
     - Refreshing model instances from the database
+    - Setting and managing Row Level Security (RLS) context
 
     ```python {{sticky: True}}
     # Create a connection
@@ -73,11 +74,12 @@ class DBConnection:
     user = User(name="Alice", email="alice@example.com")
     await conn.insert([user])
 
-    # Query data
-    users = await conn.exec(
-        select(User)
-        .where(User.name == "Alice")
-    )
+    # Query data with RLS context
+    with conn.rls_context(user_id='12345'):
+        users = await conn.exec(
+            select(User)
+            .where(User.name == "Alice")
+        )
 
     # Update data
     user.email = "newemail@example.com"
@@ -103,6 +105,7 @@ class DBConnection:
         self.obj_to_primary_key: dict[str, str | None] = {}
         self.in_transaction = False
         self.modification_tracker = ModificationTracker(uncommitted_verbosity)
+        self._rls_context: dict[str, Any] = {}
 
     async def initialize_types(self, timeout: float = 60.0) -> None:
         """
@@ -230,37 +233,44 @@ class DBConnection:
         | QueryBuilder[T, Literal["INSERT"]]
         | QueryBuilder[T, Literal["UPDATE"]]
         | QueryBuilder[T, Literal["DELETE"]],
+        rls_context: dict[str, Any] | None = None,
     ) -> list[T] | None:
         """
-        Execute a query built with QueryBuilder and return the results.
-
-        ```python {{sticky: True}}
-        # Select query
-        users = await conn.exec(
-            select(User)
-            .where(User.age >= 18)
-            .order_by(User.name)
-        )
-
-        # Select with joins and aggregates
-        results = await conn.exec(
-            select((User.name, func.count(Order.id)))
-            .join(Order, Order.user_id == User.id)
-            .group_by(User.name)
-            .having(func.count(Order.id) > 5)
-        )
-
-        # Delete query
-        await conn.exec(
-            delete(User)
-            .where(User.is_active == False)
-        )
-        ```
-
-        :param query: A QueryBuilder instance representing the query to execute
-        :return: For SELECT queries, returns a list of results. For other queries, returns None
-
+        Execute a query and return the results.
+        
+        Args:
+            query: The query to execute
+            rls_context: Optional context for Row Level Security
+            
+        Returns:
+            The query results, or None for non-SELECT queries
         """
+        # Apply RLS context if provided
+        if rls_context:
+            with self.rls_context(**rls_context):
+                return await self._exec_inner(query)
+        else:
+            return await self._exec_inner(query)
+
+    async def _exec_inner(
+        self, 
+        query: QueryBuilder[T, Literal["SELECT"]]
+        | QueryBuilder[T, Literal["INSERT"]]
+        | QueryBuilder[T, Literal["UPDATE"]]
+        | QueryBuilder[T, Literal["DELETE"]],
+    ) -> list[T] | None:
+        """
+        Internal method to execute a query with applied RLS context.
+        
+        Args:
+            query: The query to execute
+            
+        Returns:
+            The query results, or None for non-SELECT queries
+        """
+        # Apply any active RLS context before executing
+        await self._apply_rls_context()
+        
         sql_text, variables = query.build()
         LOGGER.debug(f"Executing query: {sql_text} with variables: {variables}")
         try:
@@ -857,3 +867,42 @@ class DBConnection:
                 values_list.append(row_values)
 
             yield batch_objects, values_list
+
+    @contextmanager
+    def rls_context(self, **variables):
+        """
+        Context manager to set Row Level Security variables for PostgreSQL.
+        
+        Example:
+            with conn.rls_context(user_id='12345'):
+                await conn.exec(select(User))
+        
+        Args:
+            **variables: Key-value pairs to set as PostgreSQL variables for RLS.
+        """
+        old_context = self._rls_context.copy()
+        self._rls_context = {**old_context, **variables}
+        try:
+            yield
+        finally:
+            self._rls_context = old_context
+
+    async def _apply_rls_context(self):
+        """Apply the RLS context to the current session."""
+        if not self._rls_context:
+            return
+        
+        # Start a transaction if needed to ensure SET LOCAL commands work
+        async with self._ensure_transaction():
+            for key, value in self._rls_context.items():
+                # Convert value to string and escape single quotes
+                str_value = str(value).replace("'", "''")
+                # Log the setting for debugging
+                LOGGER.debug(f"Setting RLS context: {key} = '{str_value}'")
+                # Use SET LOCAL to ensure the setting is only for this transaction
+                await self.conn.execute(f"SET LOCAL {key} = '{str_value}';")
+                
+                # Verify the setting was applied correctly if in debug mode
+                if LOGGER.isEnabledFor(10):  # DEBUG level
+                    result = await self.conn.fetchval(f"SELECT current_setting('{key}');")
+                    LOGGER.debug(f"Verified RLS context setting: {key} = {result}")

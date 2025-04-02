@@ -24,6 +24,7 @@ from iceaxe.postgres import (
     PostgresForeignKey,
     PostgresTime,
 )
+from iceaxe.rls import RLSProtocol
 from iceaxe.schemas.actions import (
     CheckConstraint,
     ColumnType,
@@ -39,6 +40,7 @@ from iceaxe.schemas.db_stubs import (
     DBObject,
     DBObjectPointer,
     DBPointerOr,
+    DBPolicy,
     DBTable,
     DBType,
     DBTypePointer,
@@ -204,30 +206,29 @@ class DatabaseMemorySerializer:
             key=lambda obj: next_ordering_by_name[obj.representation()],
         )
 
-        for next_obj in next:
-            previous_obj = previous_by_name.get(next_obj.representation())
+        # Get the set of objects by representation that exist in the previous and next generations
+        previous_reps = {obj.representation() for obj in previous}
+        next_reps = {obj.representation() for obj in next}
 
-            if previous_obj is None and next_obj is not None:
-                await next_obj.create(actor)
-            elif previous_obj is not None and next_obj is not None:
-                # Only migrate if they're actually different
-                if previous_obj != next_obj:
-                    await next_obj.migrate(previous_obj, actor)
+        # To be created are objects that don't exist in the previous one but exist in the next
+        # To be destroyed are objects that exist in the previous one but don't exist in the next
+        # To be updated are objects that exist in both the prev and next and have different values
 
-        # For all of the items that were in the previous state but not in the
-        # next state, we should delete them
-        to_delete = [
-            previous_obj
-            for previous_obj in previous
-            if previous_obj.representation() not in next_by_name
-        ]
-        # We use the reversed representation to destroy objects with more dependencies
-        # before the dependencies themselves
-        to_delete.reverse()
-        for previous_obj in to_delete:
-            await previous_obj.destroy(actor)
+        for obj in previous:
+            if obj.representation() not in next_reps:
+                actor.add_comment(f"DESTROY {obj.representation()}")
+                await obj.destroy(actor)
 
-        return actor.dry_run_actions
+        for obj in next:
+            if obj.representation() not in previous_reps:
+                actor.add_comment(f"CREATE {obj.representation()}")
+                await obj.create(actor)
+            else:
+                # This obj exists in both previous and next
+                previous_obj = previous_by_name[obj.representation()]
+                if previous_obj != obj:
+                    actor.add_comment(f"MIGRATE {obj.representation()}")
+                    await obj.migrate(previous_obj, actor)
 
 
 class TypeDeclarationResponse(DBObject):
@@ -238,193 +239,187 @@ class TypeDeclarationResponse(DBObject):
     is_list: bool = False
 
     def representation(self) -> str:
-        raise NotImplementedError()
+        raise NotImplementedError
 
-    def create(self, actor: DatabaseActions):
-        raise NotImplementedError()
+    async def create(self, actor: DatabaseActions):
+        raise NotImplementedError
 
-    def destroy(self, actor: DatabaseActions):
-        raise NotImplementedError()
+    async def destroy(self, actor: DatabaseActions):
+        raise NotImplementedError
 
-    def migrate(self, previous, actor: DatabaseActions):
-        raise NotImplementedError()
+    async def migrate(self, previous, actor: DatabaseActions):
+        raise NotImplementedError
 
 
 class DatabaseHandler:
     def __init__(self):
-        self.python_to_sql = {
-            int: ColumnType.INTEGER,
-            float: ColumnType.DOUBLE_PRECISION,
-            str: ColumnType.VARCHAR,
-            bool: ColumnType.BOOLEAN,
-            bytes: ColumnType.BYTEA,
-            UUID: ColumnType.UUID,
-            Any: ColumnType.JSON,
-        }
+        # Empty init for now - we could add more handlers in the future, registering subclasses
+        # for more operations.
+        pass
 
     def convert(self, tables: list[Type[TableBase]]):
-        for model in sorted(tables, key=lambda model: model.get_table_name()):
-            for node in self.convert_table(model):
-                yield (node.node, node.dependencies)
+        for table in tables:
+            yield from self.convert_table(table)
 
     def convert_table(self, table: Type[TableBase]):
         # Handle the table itself
-        table_nodes = self._yield_nodes(DBTable(table_name=table.get_table_name()))
-        yield from table_nodes
+        table_name = table.get_table_name()
+        table_obj = DBTable(table_name=table_name)
+        dependencies = []
+        yield table_obj, dependencies
 
         # Handle the columns
-        all_column_nodes: list[NodeDefinition] = []
-        for field_name, field in table.get_client_fields().items():
-            column_nodes = self._yield_nodes(
-                self.convert_column(field_name, field, table), dependencies=table_nodes
-            )
-            yield from column_nodes
-            all_column_nodes += column_nodes
+        primary_keys = []
+        for key, info in table.model_fields.items():
+            if not hasattr(info, "db_field_info"):
+                # If this is a normal field (not a DBField), we can't migrate it
+                continue
 
-            # Handle field-level constraints
-            yield from self._yield_nodes(
-                self.handle_single_constraints(field_name, field, table),
-                dependencies=column_nodes,
-            )
+            field_info = info.db_field_info
 
-        # Primary keys must be handled after the columns are created, since multiple
-        # columns can be primary keys but only one constraint can be created
-        primary_keys = [
-            (key, info) for key, info in table.model_fields.items() if info.primary_key
-        ]
-        yield from self._yield_nodes(
-            self.handle_primary_keys(primary_keys, table), dependencies=all_column_nodes
-        )
+            # Save information to detect if this is a primary key
+            # That's stored as a constraint, not a column property
+            if field_info.primary_key:
+                primary_keys.append((key, field_info))
 
-        if table.table_args != PydanticUndefined:
+            yield from self.convert_column(key, field_info, table)
+
+        # Handle the constraints that are applied to the table via TableBase.model_fields
+        for key, info in table.model_fields.items():
+            if not hasattr(info, "db_field_info"):
+                # If this is a normal field (not a DBField), we can't migrate it
+                continue
+
+            field_info = info.db_field_info
+            yield from self.handle_single_constraints(key, field_info, table)
+
+        # If there are primary keys, we need to register those as a constraint
+        if primary_keys:
+            yield from self.handle_primary_keys(primary_keys, table)
+
+        # Handle any constraints on the table
+        if hasattr(table, "table_args") and table.table_args != PydanticUndefined and table.table_args is not None:
             for constraint in table.table_args:
-                yield from self._yield_nodes(
-                    self.handle_multiple_constraints(constraint, table),
-                    dependencies=all_column_nodes,
-                )
+                yield from self.handle_multiple_constraints(constraint, table)
+
+        # Handle RLS policies
+        if hasattr(table, "get_rls_policies") and callable(table.get_rls_policies):
+            policies = table.get_rls_policies()
+            if policies:
+                # First enable RLS on the table
+                yield DBRLSEnabled(table_name=table_name, force=True), [table_obj]
+                
+                # Then add each policy
+                for policy in policies:
+                    policy_obj = DBPolicy(
+                        policy_name=policy.name,
+                        table_name=table_name,
+                        restrictive=policy.restrictive,
+                        command=policy.command,
+                        role="",  # Default empty role means policy applies to all roles
+                        using_expr=policy.using,
+                        check_expr=policy.check if policy.command != "SELECT" else None,
+                    )
+                    yield policy_obj, [table_obj]
 
     def convert_column(self, key: str, info: DBFieldInfo, table: Type[TableBase]):
-        if info.annotation is None:
-            raise ValueError(f"Annotation must be provided for {table.__name__}.{key}")
+        # Types must be created first, before columns that refer to them
+        yield from self.handle_column_type(key, info, table)
 
-        # Primary keys should never be nullable, regardless of their type annotation
-        is_nullable = not info.primary_key and has_null_type(info.annotation)
+        column_type, is_list = self._get_type_declaration(info)
+        table_name = table.get_table_name()
 
-        # If we need to create enums or other db-backed types, we need to do that before
-        # the column itself
-        db_annotation = self.handle_column_type(key, info, table)
-        column_type: DBTypePointer | ColumnType
-        column_dependencies: list[NodeDefinition] = []
-        if db_annotation.custom_type:
-            dependencies = self._yield_nodes(
-                db_annotation.custom_type, force_no_dependencies=True
-            )
-            column_dependencies += dependencies
-            yield from dependencies
-
-            column_type = DBTypePointer(name=db_annotation.custom_type.name)
-        elif db_annotation.primitive_type:
-            column_type = db_annotation.primitive_type
-        else:
-            raise ValueError("Column type must be provided")
-
-        # We need to create the column itself once types have been created
-        yield from self._yield_nodes(
-            DBColumn(
-                table_name=table.get_table_name(),
-                column_name=key,
-                column_type=column_type,
-                column_is_list=db_annotation.is_list,
-                nullable=is_nullable,
-                autoincrement=info.autoincrement,
-            ),
-            dependencies=column_dependencies,
+        # Create a column
+        column = DBColumn(
+            table_name=table_name,
+            column_name=key,
+            column_type=column_type,
+            column_is_list=is_list,
+            nullable=info.nullable and not info.primary_key,
+            autoincrement=info.autoincrement,
         )
 
+        # Save a pointer to the table for use in dependencies
+        table_ptr = DBTable(table_name=table_name)
+
+        yield column, [table_ptr]
+
+    def _get_type_declaration(self, info: DBFieldInfo):
+        """
+        Determine the final column type and whether it's a list. This can be
+        used by both column creation and constraint creation.
+
+        :param info: The field info containing SQL type information.
+        :return: A tuple of (column_type_pointer_or_enum, is_list)
+        """
+        is_list = False
+        column_type = None
+
+        if (hasattr(info.annotation, "__origin__") and 
+            info.annotation.__origin__ is list and 
+            hasattr(info.annotation, "__args__")):
+            # This is a list type, so we need to get the inner type
+            is_list = True
+            inner_type = info.annotation.__args__[0]
+
+            # Check if the list contains an enum type
+            if isinstance(inner_type, type) and issubclass(inner_type, ALL_ENUM_TYPES):
+                column_type = DBTypePointer(name=enum_to_name(inner_type))
+            elif not isinstance(inner_type, type) and hasattr(inner_type, "__members__"):
+                column_type = DBTypePointer(name=enum_to_name(inner_type))
+            else:
+                is_primitive = inner_type in PRIMITIVE_WRAPPER_TYPES
+                is_date = inner_type in DATE_TYPES
+                if is_primitive or is_date:
+                    # Convert Python types to Postgres types
+                    type_name = info.get_column_type()
+                    column_type = ColumnType(type_name)
+                else:
+                    # For non-primitives, we assume JSON serialization
+                    column_type = ColumnType("jsonb")
+        else:
+            # Handle enums specially
+            if isinstance(info.annotation, type) and issubclass(info.annotation, ALL_ENUM_TYPES):
+                column_type = DBTypePointer(name=enum_to_name(info.annotation))
+            elif not isinstance(info.annotation, type) and hasattr(info.annotation, "__members__"):
+                column_type = DBTypePointer(name=enum_to_name(info.annotation))
+            else:
+                # TODO: Handle generic types, custom classes for JSON, ForeignKeys
+                type_name = info.get_column_type()
+                column_type = ColumnType(type_name)
+
+        return column_type, is_list
+
     def handle_column_type(self, key: str, info: DBFieldInfo, table: Type[TableBase]):
-        if info.annotation is None:
-            raise ValueError(f"Annotation must be provided for {table.__name__}.{key}")
+        if (hasattr(info.annotation, "__origin__") and 
+            info.annotation.__origin__ is list and 
+            hasattr(info.annotation, "__args__")):
+            # For lists, we need to handle the internal type
+            inner_type = info.annotation.__args__[0]
 
-        annotation = remove_null_type(info.annotation)
+            if isinstance(inner_type, type) and issubclass(inner_type, ALL_ENUM_TYPES):
+                values = [str(value.value) for value in inner_type]
+                name = enum_to_name(inner_type)
+                
+                db_type = DBType(
+                    name=name, 
+                    values=frozenset(values), 
+                    reference_columns=frozenset([(table.get_table_name(), key)])
+                )
+                yield db_type, []
+                return
 
-        # Resolve the type of the column, if generic
-        if isinstance(annotation, TypeVar):
-            typevar_map = get_typevar_mapping(table)
-            annotation = typevar_map[annotation]
+        if isinstance(info.annotation, type) and issubclass(info.annotation, ALL_ENUM_TYPES):
+            values = [str(value.value) for value in info.annotation]
+            name = enum_to_name(info.annotation)
 
-        # Should be prioritized in terms of MRO; StrEnums should be processed
-        # before the str types
-        if is_type_compatible(annotation, ALL_ENUM_TYPES):
-            # We only support string values for enums because postgres enums are defined
-            # as name-based types
-            for value in annotation:  # type: ignore
-                if not isinstance(value.value, str):
-                    raise ValueError(
-                        f"Only string values are supported for enums, received: {value.value} (enum: {annotation})"
-                    )
-
-            return TypeDeclarationResponse(
-                custom_type=DBType(
-                    name=enum_to_name(annotation),  # type: ignore
-                    values=frozenset([value.value for value in annotation]),  # type: ignore
-                    reference_columns=frozenset({(table.get_table_name(), key)}),
-                ),
+            db_type = DBType(
+                name=name, 
+                values=frozenset(values),
+                reference_columns=frozenset([(table.get_table_name(), key)])
             )
-        elif is_type_compatible(annotation, PRIMITIVE_WRAPPER_TYPES):
-            for primitive, json_type in self.python_to_sql.items():
-                if annotation == primitive or annotation == list[primitive]:  # type: ignore
-                    return TypeDeclarationResponse(
-                        primitive_type=json_type,
-                        is_list=(annotation == list[primitive]),  # type: ignore
-                    )
-        elif is_type_compatible(annotation, DATE_TYPES):
-            if is_type_compatible(annotation, datetime):  # type: ignore
-                if isinstance(info.postgres_config, PostgresDateTime):
-                    return TypeDeclarationResponse(
-                        primitive_type=(
-                            ColumnType.TIMESTAMP_WITH_TIME_ZONE
-                            if info.postgres_config.timezone
-                            else ColumnType.TIMESTAMP
-                        )
-                    )
-                # Assume no timezone if not specified
-                return TypeDeclarationResponse(
-                    primitive_type=ColumnType.TIMESTAMP,
-                )
-            elif is_type_compatible(annotation, date):  # type: ignore
-                return TypeDeclarationResponse(
-                    primitive_type=ColumnType.DATE,
-                )
-            elif is_type_compatible(annotation, time):  # type: ignore
-                if isinstance(info.postgres_config, PostgresTime):
-                    return TypeDeclarationResponse(
-                        primitive_type=(
-                            ColumnType.TIME_WITH_TIME_ZONE
-                            if info.postgres_config.timezone
-                            else ColumnType.TIME
-                        ),
-                    )
-                return TypeDeclarationResponse(
-                    primitive_type=ColumnType.TIME,
-                )
-            elif is_type_compatible(annotation, timedelta):  # type: ignore
-                return TypeDeclarationResponse(
-                    primitive_type=ColumnType.INTERVAL,
-                )
-            else:
-                raise ValueError(f"Unsupported date type: {annotation}")
-        elif is_type_compatible(annotation, JSON_WRAPPER_FALLBACK):
-            if info.is_json:
-                return TypeDeclarationResponse(
-                    primitive_type=ColumnType.JSON,
-                )
-            else:
-                raise ValueError(
-                    f"JSON fields must have Field(is_json=True) specified: {annotation}\n"
-                    f"Column: {table.__name__}.{key}"
-                )
-
-        raise ValueError(f"Unsupported column type: {annotation}")
+            yield db_type, []
+            return
 
     def handle_single_constraints(
         self, key: str, info: DBFieldInfo, table: Type[TableBase]
@@ -435,128 +430,146 @@ class DatabaseHandler:
             foreign_key_constraint: ForeignKeyConstraint | None = None,
             check_constraint: CheckConstraint | None = None,
         ):
-            return DBConstraint(
-                table_name=table.get_table_name(),
+            # Unique and primary keys are specified elsewhere; this is handled specially
+            # for cases where we have 1 column unique constraints or primary keys
+            table_name = table.get_table_name()
+            constraint_name = DBConstraint.new_constraint_name(
+                table_name=table_name,
+                columns=[key],
                 constraint_type=constraint_type,
+            )
+
+            return DBConstraint(
+                table_name=table_name,
+                constraint_name=constraint_name,
                 columns=frozenset([key]),
-                constraint_name=DBConstraint.new_constraint_name(
-                    table.get_table_name(),
-                    [key],
-                    constraint_type,
-                ),
+                constraint_type=constraint_type,
                 foreign_key_constraint=foreign_key_constraint,
                 check_constraint=check_constraint,
             )
 
-        if info.unique:
-            yield from self._yield_nodes(_build_constraint(ConstraintType.UNIQUE))
+        table_name = table.get_table_name()
+        # Save pointers for use in dependencies
+        table_ptr = DBTable(table_name=table_name)
+        column_ptr = DBColumnPointer(table_name=table_name, column_name=key)
+
+        # Constraints for this column
+        if info.unique and not info.primary_key:
+            # Should only specify one of unique OR primary key - unique is implied by pk
+            constraint = _build_constraint(
+                constraint_type=ConstraintType.UNIQUE,
+            )
+            yield constraint, [table_ptr, column_ptr]
 
         if info.foreign_key:
-            target_table, target_column = info.foreign_key.rsplit(".", 1)
-            # Extract PostgreSQL-specific foreign key options if configured
-            on_delete = "NO ACTION"
-            on_update = "NO ACTION"
-            if isinstance(info.postgres_config, PostgresForeignKey):
-                on_delete = info.postgres_config.on_delete
-                on_update = info.postgres_config.on_update
-
-            yield from self._yield_nodes(
-                _build_constraint(
-                    ConstraintType.FOREIGN_KEY,
-                    foreign_key_constraint=ForeignKeyConstraint(
-                        target_table=target_table,
-                        target_columns=frozenset({target_column}),
-                        on_delete=on_delete,
-                        on_update=on_update,
-                    ),
-                ),
-                dependencies=[
-                    # Additional dependencies to ensure the target table/column is created first
-                    DBTable(table_name=target_table),
-                    DBColumnPointer(
-                        table_name=target_table,
-                        column_name=target_column,
-                    ),
-                    # Ensure the primary key constraint exists before the foreign key
-                    # constraint. Postgres also accepts a unique constraint on the same.
-                    DBPointerOr(
-                        pointers=tuple(
-                            [
-                                DBConstraintPointer(
-                                    table_name=target_table,
-                                    columns=frozenset([target_column]),
-                                    constraint_type=constraint_type,
-                                )
-                                for constraint_type in [
-                                    ConstraintType.PRIMARY_KEY,
-                                    ConstraintType.UNIQUE,
-                                ]
-                            ]
-                        ),
-                    ),
-                ],
-            )
-
-        if info.index:
-            yield from self._yield_nodes(_build_constraint(ConstraintType.INDEX))
-
-        if info.check_expression:
-            yield from self._yield_nodes(
-                _build_constraint(
-                    ConstraintType.CHECK,
-                    check_constraint=CheckConstraint(
-                        check_condition=info.check_expression,
-                    ),
+            parts = info.foreign_key.split(".")
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Foreign key {info.foreign_key!r} is improperly"
+                    "formatted; expected [TABLE].[COLUMN]"
                 )
+
+            ref_table, ref_col = parts
+            constraint = _build_constraint(
+                constraint_type=ConstraintType.FOREIGN_KEY,
+                foreign_key_constraint=ForeignKeyConstraint(
+                    target_table=ref_table,
+                    target_columns=frozenset([ref_col]),
+                    on_delete=info.on_delete,
+                    on_update=info.on_update,
+                ),
             )
+
+            # For FKs, we have a reference to the target table, not the source table
+            dst_table_ptr = DBTable(table_name=ref_table)
+            dst_column_ptr = DBColumnPointer(table_name=ref_table, column_name=ref_col)
+
+            yield constraint, [
+                table_ptr,
+                column_ptr,
+                dst_table_ptr,
+                dst_column_ptr,
+            ]
+
+        if info.check_fn:
+            condition = info.check_fn.__doc__
+            if not condition:
+                raise ValueError(
+                    f"Check function {info.check_fn.__name__} missing docstring with SQL condition"
+                )
+
+            constraint = _build_constraint(
+                constraint_type=ConstraintType.CHECK,
+                check_constraint=CheckConstraint(check_condition=condition),
+            )
+            yield constraint, [table_ptr, column_ptr]
 
     def handle_multiple_constraints(
         self, constraint: UniqueConstraint | IndexConstraint, table: Type[TableBase]
     ):
-        columns: list[str]
-        constraint_type: ConstraintType
+        table_name = table.get_table_name()
+        # Save a pointer to the table for use in dependencies
+        table_ptr = DBTable(table_name=table_name)
 
         if isinstance(constraint, UniqueConstraint):
-            constraint_type = ConstraintType.UNIQUE
-            columns = constraint.columns
-        elif isinstance(constraint, IndexConstraint):
-            constraint_type = ConstraintType.INDEX
-            columns = constraint.columns
-        else:
-            raise ValueError(f"Unsupported constraint type: {constraint}")
+            if not constraint.columns:
+                raise ValueError("UniqueConstraint must specify at least 1 columns")
 
-        yield from self._yield_nodes(
-            DBConstraint(
-                table_name=table.get_table_name(),
-                constraint_type=constraint_type,
-                columns=frozenset(columns),
-                constraint_name=DBConstraint.new_constraint_name(
-                    table.get_table_name(),
-                    columns,
-                    constraint_type,
-                ),
+            # Create the constraint directly
+            for i, column in enumerate(constraint.columns):
+                # Create a pointer to each column
+                yield DBColumnPointer(table_name=table_name, column_name=column), []
+
+            constraint_name = DBConstraint.new_constraint_name(
+                table_name=table_name,
+                columns=constraint.columns,
+                constraint_type=ConstraintType.UNIQUE,
             )
-        )
+            constraint_obj = DBConstraint(
+                table_name=table_name,
+                constraint_name=constraint_name,
+                columns=frozenset(constraint.columns),
+                constraint_type=ConstraintType.UNIQUE,
+            )
+            yield constraint_obj, [
+                table_ptr,
+                *[
+                    DBColumnPointer(table_name=table_name, column_name=column)
+                    for column in constraint.columns
+                ],
+            ]
+        elif isinstance(constraint, IndexConstraint):
+            pass  # IndexConstraint is not represented in the database
 
     def handle_primary_keys(
         self, keys: list[tuple[str, DBFieldInfo]], table: Type[TableBase]
     ):
-        if not keys:
-            return
+        table_name = table.get_table_name()
+        # Save a pointer to the table for use in dependencies
+        table_ptr = DBTable(table_name=table_name)
 
-        columns = [key for key, _ in keys]
-        yield from self._yield_nodes(
-            DBConstraint(
-                table_name=table.get_table_name(),
-                constraint_type=ConstraintType.PRIMARY_KEY,
-                columns=frozenset(columns),
-                constraint_name=DBConstraint.new_constraint_name(
-                    table.get_table_name(),
-                    columns,
-                    ConstraintType.PRIMARY_KEY,
-                ),
-            )
+        # Put the primary key constraint on all columns with primary_key=True
+        key_names = [k[0] for k in keys]
+        constraint_name = DBConstraint.new_constraint_name(
+            table_name=table_name,
+            columns=key_names,
+            constraint_type=ConstraintType.PRIMARY_KEY,
         )
+
+        # Create constraint
+        constraint = DBConstraint(
+            table_name=table_name,
+            constraint_name=constraint_name,
+            columns=frozenset(key_names),
+            constraint_type=ConstraintType.PRIMARY_KEY,
+        )
+        yield constraint, [
+            table_ptr,
+            *[
+                DBColumnPointer(table_name=table_name, column_name=key_name)
+                for key_name in key_names
+            ],
+        ]
 
     def _yield_nodes(
         self,
@@ -565,59 +578,88 @@ class DatabaseHandler:
         force_no_dependencies: bool = False,
     ) -> list[NodeDefinition]:
         """
-        Given potentially nested nodes, merge them into a flat list of nodes
-        with dependencies.
+        Helper method for yielding nodes from a generator.
 
-        :param force_no_dependencies: If specified, we will never merge this node
-            with any upstream dependencies.
         """
 
         def _format_dependencies(dependencies: Sequence[NodeYieldType]):
-            all_dependencies: list[DBObject | DBObjectPointer] = []
-
-            for value in dependencies:
-                if isinstance(value, (DBObject, DBObjectPointer)):
-                    all_dependencies.append(value)
-                elif isinstance(value, NodeDefinition):
-                    all_dependencies.append(value.node)
-                    all_dependencies += value.dependencies
+            result: list[DBObject | DBObjectPointer] = []
+            for dep in dependencies:
+                if isinstance(dep, NodeDefinition):
+                    result.append(dep.node)
                 else:
-                    raise ValueError(f"Unsupported dependency type: {value}")
+                    result.append(dep)
+            return result
 
-            # Sorting isn't required for the DAG but is useful for testing determinism
-            return sorted(
-                set(all_dependencies),
-                key=lambda x: x.representation(),
-            )
+        if isgenerator(child):
+            defs = []
+            for node in child:
+                defs.extend(
+                    self._yield_nodes(
+                        node, dependencies, force_no_dependencies=force_no_dependencies
+                    )
+                )
+            return defs
 
-        results: list[NodeDefinition] = []
-
-        if isinstance(child, DBObject):
-            # No dependencies list is provided, let's yield a new one
-            results.append(
+        if isinstance(child, tuple) and len(child) == 2:
+            # If we get a (node, deps) tuple from a handler, those deps
+            # should be added to the existing dependencies
+            child_node, child_deps = child
+            if not isgenerator(child_node):
+                deps = []
+                if dependencies:
+                    deps.extend(_format_dependencies(dependencies))
+                if child_deps:
+                    deps.extend(_format_dependencies(child_deps))
+                return [
+                    NodeDefinition(
+                        node=child_node, dependencies=deps, force_no_dependencies=False
+                    )
+                ]
+            else:
+                # Generator inside a tuple?!?!, just yield the nodes with the deps
+                defs = []
+                for node in child_node:
+                    defs.extend(
+                        self._yield_nodes(
+                            node, child_deps, force_no_dependencies=force_no_dependencies
+                        )
+                    )
+                return defs
+        else:
+            # Just a bare node, pass the dependencies down
+            if not isinstance(child, DBObject) and not isinstance(
+                child, DBObjectPointer
+            ):
+                raise ValueError(f"Expected DBObject or DBObjectPointer, got {child}")
+            return [
                 NodeDefinition(
                     node=child,
                     dependencies=_format_dependencies(dependencies or []),
                     force_no_dependencies=force_no_dependencies,
                 )
-            )
-        elif isinstance(child, NodeDefinition):
-            all_dependencies: list[NodeYieldType] = []
-            if not child.force_no_dependencies:
-                all_dependencies += dependencies or []
-            all_dependencies += child.dependencies
+            ]
 
-            results.append(
-                NodeDefinition(
-                    node=child.node,
-                    dependencies=_format_dependencies(all_dependencies),
-                    force_no_dependencies=force_no_dependencies,
-                )
-            )
-        elif isgenerator(child):
-            for node in child:
-                results += self._yield_nodes(node, dependencies)
-        else:
-            raise ValueError(f"Unsupported node type: {child}")
 
-        return results
+class DBRLSEnabled(DBObject):
+    """
+    Represents the RLS enablement state for a table.
+    """
+    table_name: str
+    force: bool = False
+
+    def representation(self) -> str:
+        return f"{self.table_name}_rls_enabled"
+
+    async def create(self, actor: DatabaseActions):
+        await actor.enable_rls(self.table_name, self.force)
+
+    async def migrate(self, previous: "DBRLSEnabled", actor: DatabaseActions):
+        if self.force != previous.force:
+            if self.force:
+                await actor.force_rls(self.table_name)
+            else:
+                await actor.no_force_rls(self.table_name)
+
+    async def destroy(self, actor: DatabaseActions):
+        await actor.disable_rls(self.table_name)

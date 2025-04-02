@@ -16,5 +16,6 @@ from .queries import (
     update as update,
 )
 from .queries_str import sql as sql
+from .rls import Policy as Policy, Role as Role
 from .session import DBConnection as DBConnection
 from .typing import column as column

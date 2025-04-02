@@ -764,3 +764,159 @@ class DatabaseActions:
             self.dry_run_actions.append(
                 DryRunComment(text=text, previous_line=previous_line)
             )
+
+    # Row Level Security Methods
+    
+    async def enable_rls(self, table_name: str, force: bool = False):
+        """
+        Enable Row Level Security on a table.
+        
+        :param table_name: The name of the table to enable RLS on.
+        :param force: If True, also force RLS for the table owner.
+        """
+        assert_is_safe_sql_identifier(table_name)
+        table = QueryIdentifier(table_name)
+        
+        await self._record_signature(
+            self.enable_rls,
+            dict(table_name=table_name, force=force),
+            f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;"
+        )
+        
+        if force:
+            await self._record_signature(
+                self.force_rls,
+                dict(table_name=table_name),
+                f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY;"
+            )
+
+    async def disable_rls(self, table_name: str):
+        """
+        Disable Row Level Security on a table.
+        
+        :param table_name: The name of the table to disable RLS on.
+        """
+        assert_is_safe_sql_identifier(table_name)
+        table = QueryIdentifier(table_name)
+        
+        await self._record_signature(
+            self.disable_rls,
+            dict(table_name=table_name),
+            f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY;"
+        )
+
+    async def force_rls(self, table_name: str):
+        """
+        Force Row Level Security for the table owner as well.
+        
+        :param table_name: The name of the table to force RLS on.
+        """
+        assert_is_safe_sql_identifier(table_name)
+        table = QueryIdentifier(table_name)
+        
+        await self._record_signature(
+            self.force_rls,
+            dict(table_name=table_name),
+            f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY;"
+        )
+
+    async def no_force_rls(self, table_name: str):
+        """
+        Do not force Row Level Security for the table owner.
+        
+        :param table_name: The name of the table to not force RLS on.
+        """
+        assert_is_safe_sql_identifier(table_name)
+        table = QueryIdentifier(table_name)
+        
+        await self._record_signature(
+            self.no_force_rls,
+            dict(table_name=table_name),
+            f"ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY;"
+        )
+
+    async def add_policy(
+        self,
+        table_name: str,
+        policy_name: str,
+        command: str,
+        role: str = "",
+        using_expr: str = "",
+        *,
+        check_expr: str | None = None,
+        restrictive: bool = False,
+    ):
+        """
+        Create a new Row Level Security policy on a table.
+        
+        :param table_name: Name of the table to add policy to
+        :param policy_name: Name of the policy
+        :param command: SQL operation this policy applies to (SELECT, INSERT, UPDATE, DELETE, ALL)
+        :param role: PostgreSQL role this policy applies to (empty for all roles)
+        :param using_expr: SQL expression for the USING clause
+        :param check_expr: SQL expression for the WITH CHECK clause (optional)
+        :param restrictive: Whether this is a restrictive policy (restrictive policies narrow access)
+        """
+        assert_is_safe_sql_identifier(table_name)
+        assert_is_safe_sql_identifier(policy_name)
+        
+        table = QueryIdentifier(table_name)
+        policy = QueryIdentifier(policy_name)
+        
+        # First enable RLS on the table if it's not already enabled
+        # This is necessary for policies to work
+        await self.enable_rls(table_name)
+        
+        # Build the policy creation SQL
+        sql_parts = [f"CREATE POLICY {policy} ON {table}"]
+        
+        # Add AS clause for specific roles
+        if role:
+            sql_parts.append(f"TO {role}")
+            
+        # Add FOR clause to specify command (default is ALL)
+        sql_parts.append(f"FOR {command}")
+        
+        # Add USING clause for row filtering
+        if using_expr:
+            sql_parts.append(f"USING ({using_expr})")
+            
+        # Add WITH CHECK clause for insert/update constraints
+        if check_expr:
+            sql_parts.append(f"WITH CHECK ({check_expr})")
+            
+        # Put it all together
+        sql = " ".join(sql_parts) + ";"
+        
+        await self._record_signature(
+            self.add_policy,
+            dict(
+                table_name=table_name,
+                policy_name=policy_name,
+                command=command,
+                role=role,
+                using_expr=using_expr,
+                check_expr=check_expr,
+                restrictive=restrictive,
+            ),
+            sql
+        )
+
+    async def drop_policy(self, table_name: str, policy_name: str):
+        """
+        Drop a Row Level Security policy from a table.
+        
+        :param table_name: The name of the table to drop the policy from.
+        :param policy_name: The name of the policy to drop.
+        """
+        assert_is_safe_sql_identifier(table_name)
+        assert_is_safe_sql_identifier(policy_name)
+        
+        table = QueryIdentifier(table_name)
+        policy = QueryIdentifier(policy_name)
+        
+        await self._record_signature(
+            self.drop_policy,
+            dict(table_name=table_name, policy_name=policy_name),
+            f"DROP POLICY {policy} ON {table};"
+        )

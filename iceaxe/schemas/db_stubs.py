@@ -313,6 +313,77 @@ class DBConstraint(DBObject):
             await self.create(actor)
 
 
+class DBPolicy(DBObject):
+    """
+    Represents a PostgreSQL Row-Level Security (RLS) policy.
+    """
+    policy_name: str
+    table_name: str
+    restrictive: bool
+    command: str
+    role: str
+    using_expr: str
+    check_expr: str | None = None
+    
+    def representation(self) -> str:
+        """
+        Generate a unique representation of this policy.
+        """
+        return f"{self.table_name}.policy.{self.policy_name}"
+    
+    async def create(self, actor: DatabaseActions):
+        """
+        Create the policy in the database.
+        """
+        await actor.add_policy(
+            self.table_name,
+            self.policy_name,
+            self.command,
+            self.role,
+            self.using_expr,
+            check_expr=self.check_expr,
+            restrictive=self.restrictive
+        )
+    
+    async def migrate(self, previous: Self, actor: DatabaseActions):
+        """
+        Migrate the policy to a new configuration.
+        For policies, we'll drop and recreate as they're not easily alterable.
+        """
+        await previous.destroy(actor)
+        await self.create(actor)
+    
+    async def destroy(self, actor: DatabaseActions):
+        """
+        Remove the policy from the database.
+        """
+        await actor.drop_policy(self.table_name, self.policy_name)
+
+
+class DBRLSEnabled(DBObject):
+    """
+    Represents the RLS enablement state for a table.
+    """
+    table_name: str
+    force: bool = False
+
+    def representation(self) -> str:
+        return f"{self.table_name}_rls_enabled"
+
+    async def create(self, actor: DatabaseActions):
+        await actor.enable_rls(self.table_name, self.force)
+
+    async def migrate(self, previous: "DBRLSEnabled", actor: DatabaseActions):
+        if self.force != previous.force:
+            if self.force:
+                await actor.force_rls(self.table_name)
+            else:
+                await actor.no_force_rls(self.table_name)
+
+    async def destroy(self, actor: DatabaseActions):
+        await actor.disable_rls(self.table_name)
+
+
 class DBTypeBase(BaseModel):
     name: str
 
